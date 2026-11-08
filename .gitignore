@@ -4,3 +4,4 @@ data/
 *.env
 wechat/node_modules/
 deploy.tar
+__pycache__/
