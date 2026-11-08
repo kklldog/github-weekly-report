@@ -1,0 +1,10 @@
+[Unit]
+Description=Generate GitHub Weekly Top 1 WeChat tie-tu preview
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/kklldog/github-weekly
+EnvironmentFile=/home/kklldog/github-weekly/app.env
+ExecStart=/usr/bin/python3 /home/kklldog/github-weekly/weekly_pipeline.py run

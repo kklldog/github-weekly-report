@@ -1,0 +1,11 @@
+[Unit]
+Description=Run GitHub Weekly Top 1 preview every Monday at 09:00 Asia/Shanghai
+
+[Timer]
+OnCalendar=Mon *-*-* 09:00:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=5m
+Unit=github-weekly-run.service
+
+[Install]
+WantedBy=timers.target

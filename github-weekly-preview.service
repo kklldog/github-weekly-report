@@ -1,0 +1,15 @@
+[Unit]
+Description=GitHub Weekly Top 1 WeChat tie-tu preview and confirmation watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/kklldog/github-weekly
+EnvironmentFile=/home/kklldog/github-weekly/app.env
+ExecStart=/usr/bin/python3 /home/kklldog/github-weekly/weekly_pipeline.py watch
+Restart=always
+RestartSec=20
+
+[Install]
+WantedBy=multi-user.target
