@@ -148,7 +148,12 @@ def generate_images(prompts: list[str], out_dir: Path) -> list[Path]:
         target = out_dir / f"{i:02d}.png"
         cmd = [sys.executable, str(cli), "generate", "--model", env("IMAGE_MODEL", "gpt-image-2"),
                "--prompt", prompt, "--size", "1024x1536", "--quality", "high", "--out", str(target)]
-        p = subprocess.run(cmd, cwd=str(ROOT), text=True, capture_output=True, env=os.environ.copy())
+        child_env = os.environ.copy()
+        # Keep the image CLI on the same explicitly configured provider as
+        # the editorial model; cron jobs do not inherit an interactive shell.
+        child_env["OPENAI_API_KEY"] = read_key()
+        child_env["OPENAI_BASE_URL"] = env("GPT_BASE_URL", "https://ai.dns-pro.net/v1")
+        p = subprocess.run(cmd, cwd=str(ROOT), text=True, capture_output=True, env=child_env)
         if p.returncode:
             raise RuntimeError(f"image generation failed for image {i}: {p.stderr[-500:]}")
         outputs.append(target)
