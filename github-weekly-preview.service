@@ -7,9 +7,9 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/home/kklldog/github-weekly
 EnvironmentFile=/home/kklldog/github-weekly/app.env
-ExecStart=/usr/bin/python3 /home/kklldog/github-weekly/weekly_pipeline.py watch
+ExecStart=/home/kklldog/github-weekly/.venv/bin/python /home/kklldog/github-weekly/weekly_pipeline.py watch
 Restart=always
 RestartSec=20
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

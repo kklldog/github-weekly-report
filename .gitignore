@@ -5,3 +5,4 @@ data/
 wechat/node_modules/
 deploy.tar
 __pycache__/
+.ops/
