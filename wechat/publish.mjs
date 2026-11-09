@@ -28,6 +28,24 @@ const state = data => write(stateFile, {updated_at: new Date().toISOString(), ..
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let context, page;
 let lastQr = '';
+const scanSeconds = Number(process.env.WECHAT_SCAN_TIMEOUT_SECONDS || 600);
+if (!Number.isFinite(scanSeconds) || scanSeconds <= 0) throw new Error('Invalid scan timeout');
+let stopping = false, closePromise;
+const closeBrowser = () => closePromise ||= (context ? context.close() : Promise.resolve());
+class ScanExpired extends Error {
+  constructor(stage) { super('微信扫码等待超时，浏览器将关闭，邮件确认已保留'); this.stage=stage; }
+}
+for (const [signal,code] of [['SIGTERM',143],['SIGINT',130],['SIGHUP',129]]) {
+  process.once(signal,()=>{
+    if (stopping) return;
+    stopping=true; process.exitCode=code;
+    const result={status:journal.final_clicked?'publish_unknown':'interrupted',
+      error:'任务被停止，关闭浏览器并保留现有确认；未重新提交发表'};
+    write(resultFile,result); state(result);
+    const deadline=setTimeout(()=>process.exit(code),10000); deadline.unref();
+    closeBrowser().catch(error=>console.error(error.message)).finally(()=>process.exit(code));
+  });
+}
 async function waitEditorImages() {
   await page.waitForFunction(expected=>{
     const thumbs=[...document.querySelectorAll('.image-selector__bottom-list-item')];
@@ -88,10 +106,10 @@ async function reconcile() {
   return null;
 }
 async function waitReceipt() {
-  for (let i=0; i<60; i++) {
+  for (let i=0; i<3; i++) {
     const stage = await reconcile();
     if (stage === 'published') return;
-    await sleep(30000);
+    await sleep(15000);
   }
   const r = await receipt();
   const result = {status:r && /审核中/.test(r.text)?'reviewing':'publish_unknown',
@@ -101,14 +119,15 @@ async function waitReceipt() {
 try {
   context = await chromium.launchPersistentContext(process.env.WECHAT_BROWSER_PROFILE_DIR || path.join(os.homedir(),'.config/wechat-github-weekly'), {
     executablePath:process.env.WECHAT_BROWSER_CHROME_PATH || '/usr/bin/google-chrome',
+    handleSIGTERM:false, handleSIGINT:false, handleSIGHUP:false,
     headless:process.env.WECHAT_HEADLESS !== '0', viewport:{width:1440,height:1100},
     args:['--disable-blink-features=AutomationControlled'],
   });
   page = context.pages()[0] || await context.newPage();
   await page.goto('https://mp.weixin.qq.com/', {waitUntil:'domcontentloaded'});
-  const loginDeadline = Date.now() + Number(process.env.WECHAT_SCAN_TIMEOUT_SECONDS || 86400)*1000;
+  const loginDeadline = Date.now() + scanSeconds*1000;
   while (!new URL(page.url()).searchParams.get('token')) {
-    if (Date.now()>loginDeadline) throw new Error('微信登录扫码等待超时');
+    if (Date.now()>loginDeadline) throw new ScanExpired('waiting_login');
     await qr('waiting_login');
     const refresh = page.getByText('刷新二维码',{exact:true});
     if (await refresh.isVisible().catch(()=>false)) await refresh.click();
@@ -117,7 +136,9 @@ try {
   const existing = await reconcile();
   if (existing === 'published') process.exitCode = 0;
   else if (journal.final_clicked || existing === 'reviewing' || process.argv.includes('--reconcile') || process.env.WECHAT_RECONCILE_ONLY === '1') {
-    await waitReceipt();
+    const result={status:existing==='reviewing'?'reviewing':'publish_unknown',
+      error:'本次后台核实尚未找到已发表回执；浏览器已结束核实，禁止重复提交'};
+    write(resultFile,result); state(result);
   } else {
     state({status:'editing'});
     if (journal.draft_id) {
@@ -193,9 +214,9 @@ try {
       await submit.waitFor({timeout:30000});
       updateJournal({final_clicked:true,status:'submitted',submitted_at:new Date().toISOString()});
       await submit.click();
-      const deadline=Date.now()+Number(process.env.WECHAT_SCAN_TIMEOUT_SECONDS||86400)*1000;
+      const deadline=Date.now()+scanSeconds*1000;
       while (!page.url().includes('/cgi-bin/home')) {
-        if (Date.now()>deadline) throw new Error('最终发表验证等待超时；请核实后台，禁止重复提交');
+        if (Date.now()>deadline) throw new ScanExpired('waiting_publish_scan');
         if (await page.locator('img.js_qrcode:visible').count()) await qr('waiting_publish_scan');
         await sleep(3000);
       }
@@ -203,10 +224,14 @@ try {
     }
   }
 } catch (error) {
+  if (!stopping) {
   console.error(error.stack);
-  const result={status:journal.final_clicked?'publish_unknown':'failed', error:String(error.message)};
+  const result=error instanceof ScanExpired
+    ? {status:'scan_expired',stage:error.stage,requires_verification:!!journal.final_clicked,error:error.message}
+    : {status:journal.final_clicked?'publish_unknown':'failed', error:String(error.message)};
   if (page && !page.isClosed()) await page.screenshot({path:path.join(folder,'publish-error.png')}).catch(()=>{});
-  write(resultFile,result);state(result);process.exitCode=1;
+  write(resultFile,result);state(result);process.exitCode=error instanceof ScanExpired?0:1;
+  }
 } finally {
-  if(context) await context.close();
+  await closeBrowser();
 }

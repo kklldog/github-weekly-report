@@ -421,6 +421,17 @@ def publish(folder: Path) -> None:
                 LOG.exception('读取浏览器状态或发送二维码失败')
             time.sleep(2)
     result = json.loads(result_path.read_text(encoding='utf-8')) if result_path.exists() else {}
+    if result.get('status') == 'scan_expired':
+        pending.update({'status':'scan_expired', 'platform_result':result,
+                        'error':result.get('error','微信扫码等待超时')})
+        write_json(pending_path,pending)
+        if not pending.get('scan_expired_notice_sent'):
+            notify(f"{pending['week_id']} 扫码窗口已结束",
+                   '扫码等待超时，Chrome 已关闭并释放资源。邮件确认已保留，不需要重复回复。\n'
+                   '自动发表已暂停，不会反复打开浏览器；如需继续，应先核实微信后台结果，避免重复发表。')
+            pending['scan_expired_notice_sent']=True
+            write_json(pending_path,pending)
+        return
     if result.get('status') in {'reviewing', 'publish_unknown'}:
         pending.update({'status': result['status'], 'platform_result': result,
                         'error': result.get('error', '微信后台结果尚待核实')})

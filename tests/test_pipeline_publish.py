@@ -110,6 +110,45 @@ class PublishTests(unittest.TestCase):
 
         popen.assert_not_called()
 
+    def test_scan_expired_preserves_confirmation_and_does_not_relaunch(self):
+        result = {
+            "status": "scan_expired",
+            "stage": "waiting_publish_scan",
+            "error": "扫码等待超时",
+            "requires_verification": True,
+        }
+        confirmed_uid = self.pending["confirmed_uid"]
+        package_hash = self.pending["package_hash"]
+
+        def start_publisher(*args, **kwargs):
+            Path(kwargs["env"]["WECHAT_RESULT_FILE"]).write_text(
+                json.dumps(result, ensure_ascii=False), encoding="utf-8"
+            )
+            process = mock.Mock()
+            process.poll.return_value = 0
+            process.returncode = 0
+            return process
+
+        with mock.patch.dict(os.environ, {"WECHAT_PUBLISH_CMD": "mock-publisher"}), \
+             mock.patch.object(weekly_pipeline.subprocess, "Popen", side_effect=start_publisher) as popen, \
+             mock.patch.object(weekly_pipeline, "notify") as notify, \
+             mock.patch.object(weekly_pipeline.imaplib, "IMAP4_SSL") as imap:
+            weekly_pipeline.publish(self.folder)
+
+            pending = json.loads(self.pending_path.read_text(encoding="utf-8"))
+            self.assertEqual(pending["status"], "scan_expired")
+            self.assertEqual(pending["platform_result"], result)
+            self.assertEqual(pending["confirmed_uid"], confirmed_uid)
+            self.assertEqual(pending["package_hash"], package_hash)
+
+            for _ in range(3):
+                weekly_pipeline.poll_once()
+
+        popen.assert_called_once()
+        imap.assert_not_called()
+        notify.assert_called_once()
+        self.assertRegex(notify.call_args.args[1], r"释放|已退出|已关闭|Chrome")
+
 
 if __name__ == "__main__":
     unittest.main()

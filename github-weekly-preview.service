@@ -10,6 +10,9 @@ EnvironmentFile=/home/kklldog/github-weekly/app.env
 ExecStart=/home/kklldog/github-weekly/.venv/bin/python /home/kklldog/github-weekly/weekly_pipeline.py watch
 Restart=always
 RestartSec=20
+KillMode=control-group
+TimeoutStopSec=15
+SendSIGKILL=yes
 
 [Install]
 WantedBy=default.target
