@@ -34,6 +34,39 @@ def authorized(raw):
 
 
 class ConfirmationTests(unittest.TestCase):
+    def test_accepts_chinese_reply_subject_with_rewritten_thread_id(self):
+        revised_subject = f"[GitHub周榜贴图预览] {WEEK}-r2 · dsh-superagent"
+        raw = make_message(subject="回复：" + revised_subject,
+                           in_reply_to="<tencent_reply_456@qq.com>")
+        self.assertTrue(parse_confirmation(raw, WEEK + "-r2", expected_sender=SENDER,
+                                           mailbox=MAILBOX, preview_subject=revised_subject,
+                                           preview_message_id=MESSAGE_ID))
+
+    def test_accepts_mixed_reply_prefixes_with_fullwidth_colons(self):
+        revised_subject = f"[GitHub周榜贴图预览] {WEEK}-r2 · dsh-superagent"
+        raw = make_message(subject="Re: 回复：FW：" + revised_subject,
+                           in_reply_to="<tencent_reply_456@qq.com>")
+        self.assertTrue(parse_confirmation(raw, WEEK + "-r2", expected_sender=SENDER,
+                                           mailbox=MAILBOX, preview_subject=revised_subject,
+                                           preview_message_id=MESSAGE_ID))
+
+    def test_rejects_another_revision_with_the_same_project_name(self):
+        current_subject = f"[GitHub周榜贴图预览] {WEEK}-r2 · dsh-superagent"
+        other_revision = f"[GitHub周榜贴图预览] {WEEK}-r3 · dsh-superagent"
+        raw = make_message(subject="回复：" + other_revision,
+                           in_reply_to="<tencent_reply_456@qq.com>")
+        self.assertFalse(parse_confirmation(raw, WEEK + "-r2", expected_sender=SENDER,
+                                            mailbox=MAILBOX, preview_subject=current_subject,
+                                            preview_message_id=MESSAGE_ID))
+
+    def test_chinese_reply_subject_still_rejects_wrong_sender(self):
+        revised_subject = f"[GitHub周榜贴图预览] {WEEK}-r2 · dsh-superagent"
+        raw = make_message(sender="someone@example.com", subject="回复：" + revised_subject,
+                           in_reply_to="<tencent_reply_456@qq.com>")
+        self.assertFalse(parse_confirmation(raw, WEEK + "-r2", expected_sender=SENDER,
+                                            mailbox=MAILBOX, preview_subject=revised_subject,
+                                            preview_message_id=MESSAGE_ID))
+
     def test_accepts_standalone_confirmation_in_html_reply(self):
         raw = make_message(body="<html><body><div>确认</div><blockquote>旧邮件里也有确认</blockquote></body></html>", html=True)
         self.assertTrue(authorized(raw))

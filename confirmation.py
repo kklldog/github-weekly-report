@@ -141,7 +141,7 @@ def _body_text(message: Message) -> str:
 def _normalized_subject(subject: str) -> str:
     subject = re.sub(r"\s+", " ", subject).strip()
     while True:
-        updated = re.sub(r"^(?:(?:re|fw|fwd)\s*:\s*)+", "", subject, flags=re.IGNORECASE).strip()
+        updated = re.sub(r"^(?:(?:re|fw|fwd|回复|回覆|答复|转发|轉發)\s*[:：]\s*)+", "", subject, flags=re.IGNORECASE).strip()
         if updated == subject:
             return subject.casefold()
         subject = updated
