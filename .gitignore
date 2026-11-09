@@ -1,6 +1,7 @@
 .deps/
 .secrets/
 data/
+output/
 *.env
 wechat/node_modules/
 deploy.tar

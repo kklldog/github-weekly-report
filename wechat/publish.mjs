@@ -12,7 +12,8 @@ const title = post.editorial.title;
 const caption = `${post.editorial.content}\n\n作者：${post.author}`;
 const images = fs.readdirSync(path.join(folder, 'images')).filter(f => f.endsWith('.png')).sort()
   .map(f => path.join(folder, 'images', f));
-if (!title || title.length > 20 || caption.length > 1000 || images.length < 3 || images.length > 9)
+const titleUnits = text => [...text].reduce((sum,c)=>sum+(c.codePointAt(0)<128?1:c.length*2),0);
+if (!title || titleUnits(title) > 40 || caption.length > 1000 || images.length < 3 || images.length > 9)
   throw new Error('Invalid title/caption/image limits');
 const stateFile = path.join(folder, 'wechat-state.json');
 const resultFile = process.env.WECHAT_RESULT_FILE || path.join(folder, 'wechat-result.json');
@@ -27,6 +28,16 @@ const state = data => write(stateFile, {updated_at: new Date().toISOString(), ..
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let context, page;
 let lastQr = '';
+async function waitEditorImages() {
+  await page.waitForFunction(expected=>{
+    const thumbs=[...document.querySelectorAll('.image-selector__bottom-list-item')];
+    return thumbs.length===expected && thumbs.every(e=>/https:\/\/mmbiz\./.test(e.style.backgroundImage));
+  },images.length,{timeout:180000});
+  await page.locator('#js_cover_area .js_cover_preview_new:visible').first().waitFor({timeout:90000});
+  await page.waitForFunction(()=>[...document.querySelectorAll('#js_cover_area .js_cover_loading')]
+    .every(e=>!e.getClientRects().length || ['hidden','collapse'].includes(getComputedStyle(e).visibility)
+      || getComputedStyle(e).display==='none'),{},{timeout:90000});
+}
 async function qr(status) {
   const img = page.locator('img.js_qrcode:visible, img[src*="scanloginqrcode"]:visible, img.login__type__container__scan__qrcode:visible').first();
   if (!await img.count()) return;
@@ -119,13 +130,14 @@ try {
       await page.waitForLoadState('domcontentloaded');
     }
     await page.locator('[name=title] .ProseMirror').waitFor();
+    // A saved draft hydrates asynchronously; wait before replacing its text.
+    if (journal.draft_id) await waitEditorImages();
     await page.locator('[name=title] .ProseMirror').fill(title);
     // Editor paste preserves line breaks and lets WeChat resolve topic markup.
+    // Clear through the editor input API so its document state is also reset.
+    await page.locator('.share-text__input .ProseMirror').fill('');
     await page.locator('.share-text__input .ProseMirror').evaluate((el, text) => {
       el.focus();
-      const range=document.createRange();range.selectNodeContents(el);
-      const selection=getSelection();selection.removeAllRanges();selection.addRange(range);
-      document.execCommand('delete');
       const data=new DataTransfer();data.setData('text/plain',text);
       el.dispatchEvent(new ClipboardEvent('paste',{clipboardData:data,bubbles:true,cancelable:true}));
     }, caption);
@@ -133,20 +145,30 @@ try {
       await page.locator('input[type=file]:not([name])').setInputFiles(images);
       await page.getByText('默认首图为封面',{exact:true}).waitFor({timeout:180000});
     }
-    await page.waitForFunction(expected=>{
-      const thumbs=Array.from(document.querySelectorAll('.image-selector__bottom-list-item'));
-      return thumbs.length===expected && thumbs.every(e=>/https:\/\/mmbiz\./.test(e.style.backgroundImage));
-    },images.length,{timeout:180000});
-    const actual = await page.locator('.share-text__input .ProseMirror').innerText();
+    await waitEditorImages();
     const normalize = s => s.replace(/\s+/g,'');
-    if (normalize(actual)!==normalize(caption)) throw new Error('微信编辑器正文回读不一致，停止发表');
-    if (await page.locator('[name=title] .ProseMirror').innerText() !== title) throw new Error('标题回读不一致');
+    const verifyText = async () => {
+      const actual = await page.locator('.share-text__input .ProseMirror').innerText();
+      if (normalize(actual)!==normalize(caption)) throw new Error('微信编辑器正文回读不一致，停止发表');
+      if (await page.locator('[name=title] .ProseMirror').innerText() !== title) throw new Error('标题回读不一致');
+    };
+    await verifyText();
     await page.locator('.js_claim_source_desc').click();
     await page.getByText('内容由AI生成',{exact:true}).filter({visible:true}).last().click();
     await page.locator('button.weui-desktop-btn_primary:visible').filter({hasText:/^确认$/}).click();
     await page.getByText('保存为草稿',{exact:true}).click();
     await page.waitForFunction(()=>new URL(location.href).searchParams.has('appmsgid'),{},{timeout:30000});
     updateJournal({draft_id:new URL(page.url()).searchParams.get('appmsgid'), status:'draft_saved'});
+    // Newly uploaded portrait images can show a temporary square-cover error.
+    // Reload the saved draft and wait for both platform cover variants to finish.
+    await page.reload({waitUntil:'domcontentloaded'});
+    await page.locator('[name=title] .ProseMirror').waitFor();
+    await waitEditorImages();
+    await verifyText();
+    if (await page.locator('.image-selector__bottom-list-item').count() !== images.length)
+      throw new Error('草稿图片数量回读不一致');
+    const coverErrors = await page.locator('.js_cover_error:visible').allTextContents();
+    if (coverErrors.length) throw new Error('微信封面尚未就绪：'+coverErrors.join('；'));
     await page.screenshot({path:path.join(folder,'before-publish.png')});
     state({status:'draft_saved'});
     if (process.argv.includes('--draft-only')) {
