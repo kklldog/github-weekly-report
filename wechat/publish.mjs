@@ -156,9 +156,22 @@ try {
     await page.locator('.js_claim_source_desc').click();
     await page.getByText('内容由AI生成',{exact:true}).filter({visible:true}).last().click();
     await page.locator('button.weui-desktop-btn_primary:visible').filter({hasText:/^确认$/}).click();
-    await page.getByText('保存为草稿',{exact:true}).click();
+    const [savedResponse] = await Promise.all([
+      page.waitForResponse(r=>{
+        const u=new URL(r.url());
+        return u.hostname==='mp.weixin.qq.com' && u.pathname==='/cgi-bin/operate_appmsg'
+          && ['create','update'].includes(u.searchParams.get('sub')) && r.request().method()==='POST';
+      },{timeout:90000}),
+      page.getByText('保存为草稿',{exact:true}).click(),
+    ]);
+    const savedPayload=await savedResponse.json();
+    if (!savedResponse.ok() || Number(savedPayload.ret ?? savedPayload.base_resp?.ret)!==0
+        || !/^\d+$/.test(String(savedPayload.appMsgId || '')))
+      throw new Error('微信未确认草稿保存成功：'+String(savedPayload.base_resp?.errmsg || savedPayload.ret));
+    // Existing drafts already have appmsgid; the save receipt must arrive first.
+    await page.getByText('已保存',{exact:true}).filter({visible:true}).first().waitFor({timeout:60000});
     await page.waitForFunction(()=>new URL(location.href).searchParams.has('appmsgid'),{},{timeout:30000});
-    updateJournal({draft_id:new URL(page.url()).searchParams.get('appmsgid'), status:'draft_saved'});
+    updateJournal({draft_id:String(savedPayload.appMsgId), status:'draft_saved'});
     // Newly uploaded portrait images can show a temporary square-cover error.
     // Reload the saved draft and wait for both platform cover variants to finish.
     await page.reload({waitUntil:'domcontentloaded'});
