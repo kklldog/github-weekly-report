@@ -132,7 +132,7 @@ class PublishTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"WECHAT_PUBLISH_CMD": "mock-publisher"}), \
              mock.patch.object(weekly_pipeline.subprocess, "Popen", side_effect=start_publisher) as popen, \
              mock.patch.object(weekly_pipeline, "notify") as notify, \
-             mock.patch.object(weekly_pipeline.imaplib, "IMAP4_SSL") as imap:
+             mock.patch.object(weekly_pipeline.MailService, "subscribe_forever") as subscription:
             weekly_pipeline.publish(self.folder)
 
             pending = json.loads(self.pending_path.read_text(encoding="utf-8"))
@@ -145,9 +145,98 @@ class PublishTests(unittest.TestCase):
                 weekly_pipeline.poll_once()
 
         popen.assert_called_once()
-        imap.assert_not_called()
+        subscription.assert_not_called()
         notify.assert_called_once()
         self.assertRegex(notify.call_args.args[1], r"释放|已退出|已关闭|Chrome")
+
+    def incoming(self, **overrides):
+        return {
+            "uid": 13260, "messageId": "<reply@qq.com>",
+            "from": [{"address": "zhouminjie1986@foxmail.com"}],
+            "to": [{"address": "17014842@qq.com"}],
+            "subject": "回复：" + weekly_pipeline.preview_subject(self.post["rank"], self.post["editorial"]),
+            "text": "确认", "headers": {}, **overrides,
+        }
+
+    def preview_pending(self):
+        self.pending["status"] = "preview"
+        self.pending_path.write_text(json.dumps(self.pending), encoding="utf-8")
+
+    def test_persisted_service_confirmation_survives_restart_and_can_publish(self):
+        self.preview_pending()
+        weekly_pipeline.store_notification(self.incoming())
+        # poll_once reads disk, with no dependency on the subscription process.
+        with mock.patch.object(weekly_pipeline, "publish") as publish:
+            weekly_pipeline.poll_once(publish_confirmed=False)
+            publish.assert_not_called()
+            saved = json.loads(self.pending_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["status"], "confirmed")
+            self.assertEqual(saved["confirmed_uid"], "13260")
+            weekly_pipeline.poll_once()
+            publish.assert_called_once_with(self.folder)
+
+    def test_duplicate_events_are_saved_once_without_attachments(self):
+        mail = self.incoming(attachments=[{"contentBase64": "large-image"}])
+        weekly_pipeline.store_notification(mail)
+        weekly_pipeline.store_notification({**mail, "id": "new-event-id"})
+        files = list((self.data / "mail-inbox").glob("*.json"))
+        self.assertEqual(len(files), 1)
+        self.assertNotIn("attachments", json.loads(files[0].read_text(encoding="utf-8")))
+
+    def test_changed_package_blocks_confirmation_from_service(self):
+        self.preview_pending()
+        weekly_pipeline.store_notification(self.incoming())
+        (self.folder / "images/01.png").write_bytes(b"changed")
+        with mock.patch.object(weekly_pipeline, "publish") as publish:
+            with self.assertRaisesRegex(RuntimeError, "内容已发生变化"):
+                weekly_pipeline.poll_once()
+            publish.assert_not_called()
+
+    def test_unrelated_service_mail_does_not_authorize_publication(self):
+        self.preview_pending()
+        weekly_pipeline.store_notification(self.incoming(subject="other week"))
+        with mock.patch.object(weekly_pipeline, "publish") as publish:
+            weekly_pipeline.poll_once()
+            publish.assert_not_called()
+        self.assertEqual(json.loads(self.pending_path.read_text(encoding="utf-8"))["status"], "preview")
+
+    def test_preview_saves_service_message_id_and_sends_original_images(self):
+        self.preview_pending()
+        rank = {**self.post["rank"], "repo": "example/repo"}
+        with mock.patch.object(weekly_pipeline, "MailService") as service:
+            service.return_value.send_mail.return_value = "<actual-service-id@qq.com>"
+            weekly_pipeline.send_preview(self.folder, rank, self.post["editorial"])
+            args = service.return_value.send_mail.call_args.args
+            self.assertEqual(args[3], sorted((self.folder / "images").glob("*.png")))
+        saved = json.loads(self.pending_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["preview_message_id"], "<actual-service-id@qq.com>")
+        self.assertEqual(saved["package_hash"], weekly_pipeline.package_hash(self.folder))
+
+    def test_failed_preview_send_does_not_mark_sent(self):
+        self.preview_pending()
+        rank = {**self.post["rank"], "repo": "example/repo"}
+        with mock.patch.object(weekly_pipeline, "MailService") as service:
+            service.return_value.send_mail.side_effect = RuntimeError("HTTP 502")
+            with self.assertRaisesRegex(RuntimeError, "502"):
+                weekly_pipeline.send_preview(self.folder, rank, self.post["editorial"])
+        self.assertNotIn("preview_sent_at", json.loads(self.pending_path.read_text(encoding="utf-8")))
+
+    def test_notifications_route_qr_attachment_through_service(self):
+        attachment = self.folder / "images/01.png"
+        with mock.patch.object(weekly_pipeline, "MailService") as service:
+            weekly_pipeline.notify("扫码", "请扫码", attachment)
+            service.return_value.send_mail.assert_called_once_with(
+                "zhouminjie1986@foxmail.com", "[GitHub周榜贴图] 扫码", "请扫码", [attachment])
+
+    def test_bad_notification_does_not_block_later_confirmation(self):
+        self.preview_pending()
+        weekly_pipeline.store_notification(self.incoming())
+        (self.data / "mail-inbox/zzz.json").write_text("{broken", encoding="utf-8")
+        with self.assertLogs(weekly_pipeline.LOG, level="ERROR"), \
+             mock.patch.object(weekly_pipeline, "publish") as publish:
+            weekly_pipeline.poll_once(publish_confirmed=False)
+            publish.assert_not_called()
+        self.assertEqual(json.loads(self.pending_path.read_text(encoding="utf-8"))["status"], "confirmed")
 
 
 if __name__ == "__main__":

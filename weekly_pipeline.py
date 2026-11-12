@@ -7,27 +7,21 @@ Publishing is gated by a reply containing the exact word 确认.
 """
 from __future__ import annotations
 
-import base64
-import email
-import email.message
-import email.policy
-import email.utils
-import imaplib
 import json
 import os
 import re
-import smtplib
-import ssl
 import hashlib
 import logging
 import subprocess
 import sys
 import time
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from confirmation import find_confirmation_uid
+from confirmation import parse_notification
+from mail_service import MailService
 from project_research import collect_project_evidence
 
 
@@ -236,14 +230,8 @@ def send_preview(folder: Path, rank: dict, editorial: dict) -> None:
     pending_path = DATA / 'pending.json'
     pending = json.loads(pending_path.read_text(encoding='utf-8'))
     subject_rank = {**rank, 'week_id':pending['week_id']}
-    sender = env("SMTP_USER", "17014842@qq.com")
     recipient = env("PREVIEW_TO", "zhouminjie1986@foxmail.com")
-    msg = email.message.EmailMessage()
-    msg["From"] = sender
-    msg["To"] = recipient
-    msg["Subject"] = preview_subject(subject_rank, editorial)
-    msg['Message-ID'] = email.utils.make_msgid(domain='qq.com')
-    msg['Date'] = email.utils.format_datetime(datetime.now(CN_TZ))
+    subject = preview_subject(subject_rank, editorial)
     model_error = f"\n\n模型提示：{editorial['model_error']}" if editorial.get("model_error") else ""
     revision_note = ('这是一份修订版预览。此前的已发表版本保留；回复本邮件确认后将发表这份新版。\n\n'
                      if pending.get('revision_of') else '')
@@ -255,35 +243,19 @@ def send_preview(folder: Path, rank: dict, editorial: dict) -> None:
             "收到确认后系统会进入微信公众号发表流程；如需管理员扫码，会另发二维码邮件。")
     if editorial.get('features'):
         body += '\n\n功能核对资料：\n' + '\n'.join(f"- {f['claim']}\n  {f['source_url']}" for f in editorial['features'])
-    msg.set_content(body)
     images = sorted((folder / 'images').glob('*.png'))
     if len(images) < 3:
         raise ValueError('预览邮件必须附带至少3张图片')
-    for p in images:
-        msg.add_attachment(p.read_bytes(), maintype="image", subtype="png", filename=p.name)
-    context = ssl.create_default_context()
-    with smtplib.SMTP_SSL(env("SMTP_HOST", "smtp.qq.com"), int(env("SMTP_PORT", "465")), context=context, timeout=45) as s:
-        s.login(sender, env("SMTP_AUTHCODE"))
-        s.send_message(msg)
-    pending.update({'preview_subject': str(msg['Subject']), 'preview_message_id': str(msg['Message-ID']),
+    message_id = MailService().send_mail(recipient, subject, body, images)
+    pending.update({'preview_subject': subject, 'preview_message_id': message_id,
                     'preview_sent_at': datetime.now(CN_TZ).isoformat(), 'package_hash': package_hash(folder)})
     write_json(pending_path, pending)
 
 
 def notify(subject: str, body: str, attachment: Path | None = None) -> None:
-    msg = email.message.EmailMessage()
-    msg['From'] = env('SMTP_USER', '17014842@qq.com')
-    msg['To'] = env('PREVIEW_TO', 'zhouminjie1986@foxmail.com')
-    msg['Subject'] = '[GitHub周榜贴图] ' + subject
-    msg['Message-ID'] = email.utils.make_msgid(domain='qq.com')
-    msg['Date'] = email.utils.format_datetime(datetime.now(CN_TZ))
-    msg.set_content(body)
-    if attachment:
-        msg.add_attachment(attachment.read_bytes(), maintype='image', subtype='png', filename=attachment.name)
-    with smtplib.SMTP_SSL(env('SMTP_HOST', 'smtp.qq.com'), int(env('SMTP_PORT', '465')),
-                          context=ssl.create_default_context(), timeout=45) as smtp:
-        smtp.login(msg['From'], env('SMTP_AUTHCODE'))
-        smtp.send_message(msg)
+    MailService().send_mail(env('PREVIEW_TO', 'zhouminjie1986@foxmail.com'),
+                            '[GitHub周榜贴图] ' + subject, body,
+                            [attachment] if attachment else [])
 
 
 def run_once() -> Path:
@@ -465,26 +437,47 @@ def poll_once(*, publish_confirmed: bool = True) -> None:
     if pending.get('status') == 'preview':
         folder = Path(pending['folder'])
         post = json.loads((folder / 'post.json').read_text(encoding='utf-8'))
-        with imaplib.IMAP4_SSL(env('IMAP_HOST', 'imap.qq.com'), int(env('IMAP_PORT', '993')), timeout=30) as imap:
-            imap.login(env('SMTP_USER', '17014842@qq.com'), env('SMTP_AUTHCODE'))
-            imap.select('INBOX', readonly=True)
-            uid = find_confirmation_uid(imap, week_id=pending['week_id'],
-                                        expected_sender=env('PREVIEW_TO', 'zhouminjie1986@foxmail.com'),
-                                        mailbox=env('SMTP_USER', '17014842@qq.com'),
-                                        preview_subject=pending.get('preview_subject', preview_subject(post['rank'], post['editorial'])),
-                                        preview_message_id=pending.get('preview_message_id'))
+        uid = None
+        # The subscription persists notifications independently of publishing.
+        for path in sorted((DATA / 'mail-inbox').glob('*.json'), reverse=True):
+            try:
+                mail = json.loads(path.read_text(encoding='utf-8'))
+                confirmed = parse_notification(mail, pending['week_id'],
+                                  expected_sender=env('PREVIEW_TO', 'zhouminjie1986@foxmail.com'),
+                                  mailbox=env('MAILBOX_ADDRESS', '17014842@qq.com'),
+                                  preview_subject=pending.get('preview_subject', preview_subject(post['rank'], post['editorial'])),
+                                  preview_message_id=pending.get('preview_message_id'))
+            except (ValueError, TypeError, KeyError, AttributeError):
+                LOG.exception('忽略无效收件通知：%s', path.name)
+                continue
+            if confirmed:
+                uid = str(mail['uid'])
+                break
         if uid:
             actual_hash = package_hash(folder)
             if pending.get('package_hash') and pending['package_hash'] != actual_hash:
                 raise RuntimeError('预览发送后内容已发生变化，请重新发送预览')
-            pending.update({'status': 'confirmed', 'confirmed_uid': uid.decode(),
+            pending.update({'status': 'confirmed', 'confirmed_uid': uid,
                             'confirmed_at': datetime.now(CN_TZ).isoformat(), 'package_hash': actual_hash})
             write_json(pending_file, pending)
-            LOG.info('确认已持久保存：week=%s uid=%s', pending['week_id'], uid.decode())
+            LOG.info('确认已持久保存：week=%s uid=%s', pending['week_id'], uid)
     if publish_confirmed and pending.get('status') in {
         'confirmed', 'publishing', 'waiting_login', 'waiting_publish_scan', 'reviewing', 'publish_unknown'
     }:
         publish(Path(pending['folder']))
+
+
+def store_notification(mail: dict) -> None:
+    """Persist the confirmation fields before the subscription reads another event."""
+    if not mail.get('uid'):
+        raise ValueError('QQ Postman notification has no UID')
+    identity = str(mail['uid']) + ':' + str(mail.get('messageId', ''))
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    path = DATA / 'mail-inbox' / (key + '.json')
+    if path.exists():
+        return
+    fields = ('uid', 'messageId', 'receivedAt', 'date', 'from', 'to', 'cc', 'subject', 'text', 'html', 'headers')
+    write_json(path, {field: mail[field] for field in fields if field in mail})
 
 
 def watch() -> None:
@@ -495,6 +488,12 @@ def watch() -> None:
     if sys.platform != 'win32':
         import fcntl
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # Receive during long browser/QR waits as well as ordinary polling.
+    stop = threading.Event()
+    receiver = threading.Thread(target=MailService().subscribe_forever,
+                                args=(store_notification, stop), daemon=True,
+                                name='qq-postman-subscription')
+    receiver.start()
     while True:
         try:
             poll_once()

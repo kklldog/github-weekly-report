@@ -1,7 +1,7 @@
 from email.message import EmailMessage
 import unittest
 
-from confirmation import find_confirmation_uid, parse_confirmation
+from confirmation import parse_confirmation, parse_notification
 
 
 SENDER = "zhouminjie1986@foxmail.com"
@@ -120,35 +120,33 @@ class ConfirmationTests(unittest.TestCase):
                                             preview_subject=SUBJECT, issue_token="issue-token-abc"))
 
 
-class FakeIMAP:
-    def __init__(self, messages):
-        self.messages = messages
-        self.calls = []
+class NotificationTests(unittest.TestCase):
+    def notification(self, **overrides):
+        return {'uid': 42, 'from': [{'address': SENDER}], 'to': [{'address': MAILBOX}],
+                'subject': '回复：' + SUBJECT, 'text': '确认',
+                'headers': {'in-reply-to': '<' + MESSAGE_ID + '>'}, **overrides}
 
-    def uid(self, command, *args):
-        self.calls.append((command, args))
-        if command == "SEARCH":
-            return "OK", [b"1 2 3"]
-        if command == "FETCH":
-            uid = args[0]
-            return "OK", [(b"1 (BODY[] {size})".replace(b"{size}", str(len(self.messages[uid])).encode()), self.messages[uid])]
-        raise AssertionError(f"unexpected IMAP command: {command}")
+    def accepted(self, mail):
+        return parse_notification(mail, WEEK, expected_sender=SENDER, mailbox=MAILBOX,
+                                  preview_subject=SUBJECT, preview_message_id=MESSAGE_ID)
 
+    def test_accepts_service_notification_with_exact_thread(self):
+        self.assertTrue(self.accepted(self.notification()))
 
-class IMAPTests(unittest.TestCase):
-    def test_scans_seen_and_unseen_by_uid_with_peek_without_changing_flags(self):
-        messages = {
-            b"1": make_message(body="确认", subject="unrelated"),
-            b"2": make_message(body="没有确认"),
-            b"3": make_message(body="确认"),
-        }
-        imap = FakeIMAP(messages)
-        found = find_confirmation_uid(imap, week_id=WEEK, expected_sender=SENDER, mailbox=MAILBOX,
-                                      preview_subject=SUBJECT, preview_message_id=MESSAGE_ID)
-        self.assertEqual(found, b"3")
-        self.assertEqual(imap.calls[0], ("SEARCH", (None, "FROM", f'"{SENDER}"')))
-        self.assertTrue(all(args[1] == "(BODY.PEEK[])" for command, args in imap.calls if command == "FETCH"))
-        self.assertFalse(any(command == "STORE" for command, _ in imap.calls))
+    def test_rejects_wrong_sender_and_recipient(self):
+        self.assertFalse(self.accepted(self.notification(**{'from': [{'address': 'wrong@example.test'}]})))
+        self.assertFalse(self.accepted(self.notification(to=[{'address': 'wrong@example.test'}])))
+
+    def test_preserves_html_quote_boundaries(self):
+        self.assertFalse(self.accepted(self.notification(
+            text='收到\n确认', html='<div>收到</div><blockquote>确认</blockquote>')))
+
+    def test_header_sender_cannot_override_parsed_sender(self):
+        self.assertFalse(self.accepted(self.notification(
+            **{'from': [], 'headers': {'from': SENDER, 'to': MAILBOX}})))
+
+    def test_rejects_another_issue(self):
+        self.assertFalse(self.accepted(self.notification(subject='其他期次', headers={})))
 
 
 if __name__ == "__main__":

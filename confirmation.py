@@ -1,14 +1,14 @@
-"""Strict email confirmation parsing and non-destructive IMAP helpers."""
+"""Strict email confirmation parsing for QQ Postman notifications."""
 from __future__ import annotations
 
 from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.message import Message
+from email.message import EmailMessage
 from email.policy import default
 from email.utils import getaddresses
 from html.parser import HTMLParser
 import re
-from typing import Protocol
 
 
 def _addresses(message: Message, header: str) -> set[str]:
@@ -194,37 +194,17 @@ def parse_confirmation(
     return False
 
 
-class UIDMailClient(Protocol):
-    def uid(self, command: str, *args: object) -> tuple[object, list[object]]: ...
-
-
-def find_confirmation_uid(
-    imap: UIDMailClient,
-    *,
-    week_id: str,
-    expected_sender: str,
-    mailbox: str,
-    preview_subject: str,
-    preview_message_id: str | None = None,
-    issue_token: str | None = None,
-    limit: int = 100,
-) -> bytes | None:
-    """Find an authorized message using UID and BODY.PEEK[], including Seen mail.
-
-    This helper never changes message flags. The caller may mark only the
-    returned UID as Seen after it has handled the confirmation.
-    """
-    status, search_data = imap.uid("SEARCH", None, "FROM", f'"{expected_sender}"')
-    if status != "OK" or not search_data or not search_data[0]:
-        return None
-    uids = search_data[0].split()[-max(1, limit):]
-    for uid in reversed(uids):
-        status, fetch_data = imap.uid("FETCH", uid, "(BODY.PEEK[])")
-        if status != "OK":
-            continue
-        raw = next((item[1] for item in fetch_data or [] if isinstance(item, tuple) and len(item) > 1 and isinstance(item[1], bytes)), None)
-        if raw and parse_confirmation(raw, week_id, expected_sender=expected_sender, mailbox=mailbox,
-                                      preview_subject=preview_subject, preview_message_id=preview_message_id,
-                                      issue_token=issue_token):
-            return uid
-    return None
+def parse_notification(mail: dict, week_id: str, **expected: str) -> bool:
+    """Adapt the service's parsed JSON without accepting arbitrary mail headers."""
+    message = EmailMessage()
+    for field in ('from', 'to', 'cc'):
+        message[field] = ', '.join(item['address'] for item in mail.get(field, []) if item.get('address'))
+    message['Subject'] = mail.get('subject', '')
+    headers = {key.lower(): value for key, value in mail.get('headers', {}).items()}
+    for field in ('in-reply-to', 'references'):
+        if headers.get(field):
+            message[field] = headers[field]
+    message.set_content(mail.get('text', ''))
+    if mail.get('html'):
+        message.add_alternative(mail['html'], subtype='html')
+    return parse_confirmation(message.as_bytes(), week_id, **expected)
